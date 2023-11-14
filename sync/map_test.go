@@ -8,23 +8,149 @@ import (
 	"math/rand"
 	"reflect"
 	"runtime"
-	gosync "sync"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/quick"
 
-	"github.com/kralicky/gpkg/sync"
+	gsync "github.com/kralicky/gpkg/sync"
 )
+
+type mapOp string
+
+const (
+	opLoad             = mapOp("Load")
+	opStore            = mapOp("Store")
+	opLoadOrStore      = mapOp("LoadOrStore")
+	opLoadAndDelete    = mapOp("LoadAndDelete")
+	opDelete           = mapOp("Delete")
+	opSwap             = mapOp("Swap")
+	opCompareAndSwap   = mapOp("CompareAndSwap")
+	opCompareAndDelete = mapOp("CompareAndDelete")
+)
+
+var mapOps = [...]mapOp{
+	opLoad,
+	opStore,
+	opLoadOrStore,
+	opLoadAndDelete,
+	opDelete,
+	opSwap,
+	opCompareAndSwap,
+	opCompareAndDelete,
+}
+
+// mapCall is a quick.Generator for calls on mapInterface.
+type mapCall struct {
+	op   mapOp
+	k, v any
+}
+
+func (c mapCall) apply(m mapInterface) (any, bool) {
+	switch c.op {
+	case opLoad:
+		return m.Load(c.k)
+	case opStore:
+		m.Store(c.k, c.v)
+		return nil, false
+	case opLoadOrStore:
+		return m.LoadOrStore(c.k, c.v)
+	case opLoadAndDelete:
+		return m.LoadAndDelete(c.k)
+	case opDelete:
+		m.Delete(c.k)
+		return nil, false
+	case opSwap:
+		return m.Swap(c.k, c.v)
+	case opCompareAndSwap:
+		if m.CompareAndSwap(c.k, c.v, rand.Int()) {
+			m.Delete(c.k)
+			return c.v, true
+		}
+		return nil, false
+	case opCompareAndDelete:
+		if m.CompareAndDelete(c.k, c.v) {
+			if _, ok := m.Load(c.k); !ok {
+				return nil, true
+			}
+		}
+		return nil, false
+	default:
+		panic("invalid mapOp")
+	}
+}
+
+type mapResult struct {
+	value any
+	ok    bool
+}
+
+func randValue(r *rand.Rand) any {
+	b := make([]byte, r.Intn(4))
+	for i := range b {
+		b[i] = 'a' + byte(rand.Intn(26))
+	}
+	return string(b)
+}
+
+func (mapCall) Generate(r *rand.Rand, size int) reflect.Value {
+	c := mapCall{op: mapOps[rand.Intn(len(mapOps))], k: randValue(r)}
+	switch c.op {
+	case opStore, opLoadOrStore:
+		c.v = randValue(r)
+	}
+	return reflect.ValueOf(c)
+}
+
+func applyCalls(m mapInterface, calls []mapCall) (results []mapResult, final map[any]any) {
+	for _, c := range calls {
+		v, ok := c.apply(m)
+		results = append(results, mapResult{v, ok})
+	}
+
+	final = make(map[any]any)
+	m.Range(func(k, v any) bool {
+		final[k] = v
+		return true
+	})
+
+	return results, final
+}
+
+func applyMap(calls []mapCall) ([]mapResult, map[any]any) {
+	return applyCalls(new(gsync.Map[any, any]), calls)
+}
+
+func applyRWMutexMap(calls []mapCall) ([]mapResult, map[any]any) {
+	return applyCalls(new(RWMutexMap), calls)
+}
+
+func applyDeepCopyMap(calls []mapCall) ([]mapResult, map[any]any) {
+	return applyCalls(new(DeepCopyMap), calls)
+}
+
+func TestMapMatchesRWMutex(t *testing.T) {
+	if err := quick.CheckEqual(applyMap, applyRWMutexMap, nil); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestMapMatchesDeepCopy(t *testing.T) {
+	if err := quick.CheckEqual(applyMap, applyDeepCopyMap, nil); err != nil {
+		t.Error(err)
+	}
+}
 
 func TestConcurrentRange(t *testing.T) {
 	const mapSize = 1 << 10
 
-	m := new(sync.Map[int64, int64])
+	m := new(gsync.Map[int64, int64])
 	for n := int64(1); n <= mapSize; n++ {
 		m.Store(n, int64(n))
 	}
 
 	done := make(chan struct{})
-	var wg gosync.WaitGroup
+	var wg sync.WaitGroup
 	defer func() {
 		close(done)
 		wg.Wait()
@@ -58,7 +184,7 @@ func TestConcurrentRange(t *testing.T) {
 	for n := iters; n > 0; n-- {
 		seen := make(map[int64]bool, mapSize)
 
-		m.Range(func(k int64, v int64) bool {
+		m.Range(func(k, v int64) bool {
 			if v%k != 0 {
 				t.Fatalf("while Storing multiples of %v, Range saw value %v", k, v)
 			}
@@ -76,7 +202,7 @@ func TestConcurrentRange(t *testing.T) {
 }
 
 func TestIssue40999(t *testing.T) {
-	var m sync.Map[*int, struct{}]
+	var m gsync.Map[any, struct{}]
 
 	// Since the miss-counting in missLocked (via Delete)
 	// compares the miss count with len(m.dirty),
@@ -99,7 +225,7 @@ func TestIssue40999(t *testing.T) {
 }
 
 func TestMapRangeNestedCall(t *testing.T) { // Issue 46399
-	var m sync.Map[int, string]
+	var m gsync.Map[int, string]
 	for i, v := range [3]string{"hello", "world", "Go"} {
 		m.Store(i, v)
 	}
@@ -145,5 +271,25 @@ func TestMapRangeNestedCall(t *testing.T) { // Issue 46399
 
 	if length != 0 {
 		t.Fatalf("Unexpected sync.Map size, got %v want %v", length, 0)
+	}
+}
+
+func TestCompareAndSwap_NonExistingKey(t *testing.T) {
+	m := &gsync.Map[int, int]{}
+	if m.CompareAndSwap(12345, 0, 42) {
+		// See https://go.dev/issue/51972#issuecomment-1126408637.
+		t.Fatalf("CompareAndSwap on an non-existing key succeeded")
+	}
+}
+
+func TestMapRangeNoAllocations(t *testing.T) { // Issue 62404
+	var m gsync.Map[struct{}, struct{}]
+	allocs := testing.AllocsPerRun(10, func() {
+		m.Range(func(key, value struct{}) bool {
+			return true
+		})
+	})
+	if allocs > 0 {
+		t.Errorf("AllocsPerRun of m.Range = %v; want 0", allocs)
 	}
 }
