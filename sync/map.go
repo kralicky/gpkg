@@ -77,7 +77,7 @@ type readOnly[K comparable, V comparable] struct {
 
 // expunged is an arbitrary pointer that marks entries which have been deleted
 // from the dirty map.
-var expunged = unsafe.Pointer(new(any))
+var expunged = unsafe.Pointer(new(struct{}))
 
 func isExpunged[T any](p *T) bool {
 	return unsafe.Pointer(p) == expunged
